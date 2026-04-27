@@ -1,0 +1,4 @@
+"method","n","events","c_index","c_index_se"
+"Complete-case",2861,1287,0.648,0.0082
+"Simple imputation",7767,3953,0.674,0.0045
+"Multiple imputation (MICE)",7767,3953,0.6711,0.0045

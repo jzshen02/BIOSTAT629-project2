@@ -1,0 +1,25 @@
+"method","term","HR","conf.low","conf.high","p.value"
+"Complete-case","CURRENT_AGE_DEID",1.002,0.997,1.008,0.473
+"Complete-case","GENDERMale",1.256,1.124,1.404,5.58e-05
+"Complete-case","STAGE_HIGHEST_RECORDEDStage 4",2.556,2.276,2.871,1.12e-56
+"Complete-case","TMB_NONSYNONYMOUS",1.002,0.995,1.009,0.536
+"Complete-case","SMOKING_PREDICTIONS_3_CLASSESNever",0.81,0.703,0.932,0.00324
+"Complete-case","HISTORY_OF_PDL1Yes",0.734,0.536,1.007,0.0552
+"Complete-case","PRIOR_MED_TO_MSKPrior medications to MSK",1.35,1.173,1.554,2.87e-05
+"Complete-case","PDL1_POSITIVEYes",1.279,0.944,1.734,0.112
+"Simple imputation","CURRENT_AGE_DEID",0.991,0.988,0.994,5.76e-09
+"Simple imputation","GENDERMale",1.344,1.262,1.432,5.59e-20
+"Simple imputation","STAGE_HIGHEST_RECORDEDStage 4",2.822,2.642,3.014,1.55e-208
+"Simple imputation","TMB_NONSYNONYMOUS",1.002,0.998,1.006,0.257
+"Simple imputation","SMOKING_PREDICTIONS_3_CLASSESNever",0.678,0.627,0.734,3.54e-22
+"Simple imputation","HISTORY_OF_PDL1Yes",0.821,0.768,0.877,5.45e-09
+"Simple imputation","PRIOR_MED_TO_MSKPrior medications to MSK",1.321,1.215,1.435,6.28e-11
+"Simple imputation","PDL1_POSITIVEYes",1.143,1.027,1.272,0.0142
+"Multiple imputation (MICE)","CURRENT_AGE_DEID",0.991,0.988,0.994,9.47e-09
+"Multiple imputation (MICE)","GENDERMale",1.347,1.264,1.435,5.21e-20
+"Multiple imputation (MICE)","STAGE_HIGHEST_RECORDEDStage 4",2.818,2.637,3.013,3.08e-179
+"Multiple imputation (MICE)","TMB_NONSYNONYMOUS",1.002,0.998,1.006,0.343
+"Multiple imputation (MICE)","SMOKING_PREDICTIONS_3_CLASSESNever",0.701,0.647,0.759,1.38e-17
+"Multiple imputation (MICE)","HISTORY_OF_PDL1Yes",0.843,0.629,1.131,0.272
+"Multiple imputation (MICE)","PRIOR_MED_TO_MSKPrior medications to MSK",1.38,1.271,1.498,6.46e-14
+"Multiple imputation (MICE)","PDL1_POSITIVEYes",1.151,0.852,1.556,0.375

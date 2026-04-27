@@ -1,0 +1,555 @@
+---
+title: "Final Project Reproducibility Report"
+author: "Junzhe Shen"
+date: "2026-04-26"
+format:
+  html:
+    toc: true
+    format-links: false
+  docx: default
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Setup
+
+```{r}
+set.seed(629)
+
+library(data.table)
+library(dplyr)
+library(stringr)
+library(survival)
+library(mice)
+library(broom)
+library(ggplot2)
+library(survminer)
+
+options(stringsAsFactors = FALSE)
+
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+dir.create("models", showWarnings = FALSE)
+dir.create("datasets", showWarnings = FALSE)
+
+fig_dir <- "figures"
+tab_dir <- "tables"
+model_dir <- "models"
+data_dir <- "datasets"
+```
+
+## Read data
+
+```{r}
+patient_url <- "https://media.githubusercontent.com/media/cBioPortal/datahub/refs/heads/master/public/msk_chord_2024/data_clinical_patient.txt"
+sample_url  <- "https://media.githubusercontent.com/media/cBioPortal/datahub/refs/heads/master/public/msk_chord_2024/data_clinical_sample.txt"
+
+patient <- read.delim(
+  patient_url,
+  comment.char = "#",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+sample <- read.delim(
+  sample_url,
+  comment.char = "#",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+```
+
+## Build analysis dataset
+
+```{r}
+clean_missing <- function(x) {
+  if (is.character(x) || is.factor(x)) {
+    x <- trimws(as.character(x))
+    x[x %in% c("", "NA", "Unknown", "UNKNOWN", "Not Available", "NOT_AVAILABLE", "Not Reported", "NOT_REPORTED")] <- NA
+  }
+  x
+}
+
+get_mode <- function(x) {
+  ux <- unique(x[!is.na(x)])
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+sample1 <- sample %>%
+  group_by(PATIENT_ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(
+    PATIENT_ID,
+    CANCER_TYPE,
+    TMB_NONSYNONYMOUS,
+    MSI_SCORE,
+    MSI_TYPE,
+    PDL1_POSITIVE
+  )
+
+nsclc_analysis_df <- patient %>%
+  select(
+    PATIENT_ID,
+    OS_MONTHS,
+    OS_STATUS,
+    CURRENT_AGE_DEID,
+    GENDER,
+    STAGE_HIGHEST_RECORDED,
+    SMOKING_PREDICTIONS_3_CLASSES,
+    HISTORY_OF_PDL1,
+    PRIOR_MED_TO_MSK
+  ) %>%
+  left_join(sample1, by = "PATIENT_ID") %>%
+  filter(str_detect(CANCER_TYPE, regex("non-small cell lung|nsclc", ignore_case = TRUE))) %>%
+  mutate(
+    across(
+      c(
+        GENDER, STAGE_HIGHEST_RECORDED, SMOKING_PREDICTIONS_3_CLASSES,
+        HISTORY_OF_PDL1, PRIOR_MED_TO_MSK, PDL1_POSITIVE, MSI_TYPE
+      ),
+      clean_missing
+    ),
+    OS_MONTHS = suppressWarnings(as.numeric(OS_MONTHS)),
+    CURRENT_AGE_DEID = suppressWarnings(as.numeric(CURRENT_AGE_DEID)),
+    TMB_NONSYNONYMOUS = suppressWarnings(as.numeric(TMB_NONSYNONYMOUS)),
+    MSI_SCORE = suppressWarnings(as.numeric(MSI_SCORE)),
+    event = ifelse(OS_STATUS == "1:DECEASED", 1L, 0L)
+  )
+
+model_vars <- c(
+  "OS_MONTHS", "event", "CURRENT_AGE_DEID", "GENDER",
+  "STAGE_HIGHEST_RECORDED", "TMB_NONSYNONYMOUS",
+  "SMOKING_PREDICTIONS_3_CLASSES", "HISTORY_OF_PDL1",
+  "PRIOR_MED_TO_MSK", "PDL1_POSITIVE"
+)
+```
+
+## Cohort summaries
+
+```{r}
+cohort_summary <- data.frame(
+  n = nrow(nsclc_analysis_df),
+  events = sum(nsclc_analysis_df$event == 1, na.rm = TRUE),
+  event_rate_pct = round(100 * mean(nsclc_analysis_df$event == 1, na.rm = TRUE), 2),
+  median_os = round(median(nsclc_analysis_df$OS_MONTHS, na.rm = TRUE), 2),
+  q1_os = round(quantile(nsclc_analysis_df$OS_MONTHS, 0.25, na.rm = TRUE), 2),
+  q3_os = round(quantile(nsclc_analysis_df$OS_MONTHS, 0.75, na.rm = TRUE), 2),
+  mean_os = round(mean(nsclc_analysis_df$OS_MONTHS, na.rm = TRUE), 2)
+)
+
+missingness_final <- data.frame(
+  variable = model_vars[model_vars != "OS_MONTHS" & model_vars != "event"],
+  missing_n = sapply(model_vars[model_vars != "OS_MONTHS" & model_vars != "event"], function(v) sum(is.na(nsclc_analysis_df[[v]]))),
+  missing_pct = round(
+    100 * sapply(model_vars[model_vars != "OS_MONTHS" & model_vars != "event"], function(v) sum(is.na(nsclc_analysis_df[[v]]))) / nrow(nsclc_analysis_df),
+    2
+  )
+) %>%
+  arrange(desc(missing_pct))
+
+complete_case_summary_final <- data.frame(
+  n = nrow(nsclc_analysis_df),
+  complete_case_n = sum(complete.cases(nsclc_analysis_df[, model_vars])),
+  complete_case_pct = round(100 * sum(complete.cases(nsclc_analysis_df[, model_vars])) / nrow(nsclc_analysis_df), 2)
+)
+
+cohort_summary
+missingness_final
+complete_case_summary_final
+
+write.csv(cohort_summary, file.path(tab_dir, "cohort_summary_nsclc.csv"), row.names = FALSE)
+write.csv(missingness_final, file.path(tab_dir, "missingness_final_nsclc.csv"), row.names = FALSE)
+write.csv(complete_case_summary_final, file.path(tab_dir, "complete_case_summary_final_nsclc.csv"), row.names = FALSE)
+```
+
+## Complete-case analysis
+
+```{r}
+cc_df <- nsclc_analysis_df %>%
+  select(all_of(model_vars)) %>%
+  filter(complete.cases(.)) %>%
+  mutate(
+    GENDER = factor(GENDER),
+    STAGE_HIGHEST_RECORDED = factor(STAGE_HIGHEST_RECORDED),
+    SMOKING_PREDICTIONS_3_CLASSES = factor(SMOKING_PREDICTIONS_3_CLASSES),
+    HISTORY_OF_PDL1 = factor(HISTORY_OF_PDL1),
+    PRIOR_MED_TO_MSK = factor(PRIOR_MED_TO_MSK),
+    PDL1_POSITIVE = factor(PDL1_POSITIVE)
+  )
+
+cox_cc <- coxph(
+  Surv(OS_MONTHS, event) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED +
+    TMB_NONSYNONYMOUS + SMOKING_PREDICTIONS_3_CLASSES + HISTORY_OF_PDL1 +
+    PRIOR_MED_TO_MSK + PDL1_POSITIVE,
+  data = cc_df
+)
+
+cc_results <- tidy(cox_cc, exponentiate = TRUE, conf.int = TRUE)
+cc_perf <- data.frame(
+  method = "Complete-case",
+  n = nrow(cc_df),
+  events = sum(cc_df$event == 1),
+  c_index = round(summary(cox_cc)$concordance[1], 4),
+  c_index_se = round(summary(cox_cc)$concordance[2], 4)
+)
+
+cc_df <- cc_df %>%
+  mutate(
+    risk_score = predict(cox_cc, type = "lp"),
+    risk_group = ifelse(risk_score >= median(risk_score, na.rm = TRUE), "High risk", "Low risk"),
+    risk_group = factor(risk_group, levels = c("Low risk", "High risk"))
+  )
+
+cc_perf
+cc_results
+
+write.csv(cc_results, file.path(tab_dir, "cox_complete_case_results.csv"), row.names = FALSE)
+write.csv(cc_perf, file.path(tab_dir, "cox_complete_case_performance.csv"), row.names = FALSE)
+write.csv(cc_df, file.path(data_dir, "complete_case_dataset_with_riskscore.csv"), row.names = FALSE)
+saveRDS(cox_cc, file.path(model_dir, "cox_complete_case_model.rds"))
+saveRDS(cc_df, file.path(data_dir, "complete_case_dataset_with_riskscore.rds"))
+```
+
+## Simple imputation
+
+```{r}
+si_df <- nsclc_analysis_df %>%
+  select(all_of(model_vars))
+
+si_df$CURRENT_AGE_DEID[is.na(si_df$CURRENT_AGE_DEID)] <- median(si_df$CURRENT_AGE_DEID, na.rm = TRUE)
+si_df$TMB_NONSYNONYMOUS[is.na(si_df$TMB_NONSYNONYMOUS)] <- median(si_df$TMB_NONSYNONYMOUS, na.rm = TRUE)
+
+cat_vars <- c(
+  "GENDER", "STAGE_HIGHEST_RECORDED", "SMOKING_PREDICTIONS_3_CLASSES",
+  "HISTORY_OF_PDL1", "PRIOR_MED_TO_MSK", "PDL1_POSITIVE"
+)
+
+for (v in cat_vars) {
+  si_df[[v]][is.na(si_df[[v]])] <- get_mode(si_df[[v]])
+}
+
+si_df <- si_df %>%
+  mutate(
+    GENDER = factor(GENDER),
+    STAGE_HIGHEST_RECORDED = factor(STAGE_HIGHEST_RECORDED),
+    SMOKING_PREDICTIONS_3_CLASSES = factor(SMOKING_PREDICTIONS_3_CLASSES),
+    HISTORY_OF_PDL1 = factor(HISTORY_OF_PDL1),
+    PRIOR_MED_TO_MSK = factor(PRIOR_MED_TO_MSK),
+    PDL1_POSITIVE = factor(PDL1_POSITIVE)
+  )
+
+cox_si <- coxph(
+  Surv(OS_MONTHS, event) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED +
+    TMB_NONSYNONYMOUS + SMOKING_PREDICTIONS_3_CLASSES + HISTORY_OF_PDL1 +
+    PRIOR_MED_TO_MSK + PDL1_POSITIVE,
+  data = si_df
+)
+
+si_results <- tidy(cox_si, exponentiate = TRUE, conf.int = TRUE)
+si_perf <- data.frame(
+  method = "Simple imputation",
+  n = nrow(si_df),
+  events = sum(si_df$event == 1),
+  c_index = round(summary(cox_si)$concordance[1], 4),
+  c_index_se = round(summary(cox_si)$concordance[2], 4)
+)
+
+si_df <- si_df %>%
+  mutate(
+    risk_score = predict(cox_si, type = "lp"),
+    risk_group = ifelse(risk_score >= median(risk_score, na.rm = TRUE), "High risk", "Low risk"),
+    risk_group = factor(risk_group, levels = c("Low risk", "High risk"))
+  )
+
+si_perf
+si_results
+
+write.csv(si_results, file.path(tab_dir, "cox_simple_imputation_results.csv"), row.names = FALSE)
+write.csv(si_perf, file.path(tab_dir, "cox_simple_imputation_performance.csv"), row.names = FALSE)
+write.csv(si_df, file.path(data_dir, "simple_imputation_dataset_with_riskscore.csv"), row.names = FALSE)
+saveRDS(cox_si, file.path(model_dir, "cox_simple_imputation_model.rds"))
+saveRDS(si_df, file.path(data_dir, "simple_imputation_dataset_with_riskscore.rds"))
+```
+
+## MICE
+
+```{r}
+mi_df <- nsclc_analysis_df %>%
+  select(all_of(model_vars))
+
+mi_df$CURRENT_AGE_DEID[is.na(mi_df$CURRENT_AGE_DEID)] <- median(mi_df$CURRENT_AGE_DEID, na.rm = TRUE)
+mi_df$GENDER[is.na(mi_df$GENDER)] <- get_mode(mi_df$GENDER)
+mi_df$STAGE_HIGHEST_RECORDED[is.na(mi_df$STAGE_HIGHEST_RECORDED)] <- get_mode(mi_df$STAGE_HIGHEST_RECORDED)
+
+mi_df <- mi_df %>%
+  mutate(
+    GENDER = factor(GENDER),
+    STAGE_HIGHEST_RECORDED = factor(STAGE_HIGHEST_RECORDED),
+    SMOKING_PREDICTIONS_3_CLASSES = factor(SMOKING_PREDICTIONS_3_CLASSES),
+    HISTORY_OF_PDL1 = factor(HISTORY_OF_PDL1),
+    PRIOR_MED_TO_MSK = factor(PRIOR_MED_TO_MSK),
+    PDL1_POSITIVE = factor(PDL1_POSITIVE)
+  )
+
+init <- mice(mi_df, maxit = 0, printFlag = FALSE)
+meth <- init$method
+pred <- init$predictorMatrix
+
+meth[c("OS_MONTHS", "event", "CURRENT_AGE_DEID", "GENDER", "STAGE_HIGHEST_RECORDED", "TMB_NONSYNONYMOUS")] <- ""
+meth["SMOKING_PREDICTIONS_3_CLASSES"] <- "polyreg"
+meth["HISTORY_OF_PDL1"] <- "logreg"
+meth["PRIOR_MED_TO_MSK"] <- "logreg"
+meth["PDL1_POSITIVE"] <- "logreg"
+
+pred[, c("OS_MONTHS", "event")] <- 1
+pred[c("OS_MONTHS", "event"), ] <- 0
+pred[c("CURRENT_AGE_DEID", "GENDER", "STAGE_HIGHEST_RECORDED", "TMB_NONSYNONYMOUS"), ] <- 0
+diag(pred) <- 0
+
+imp <- mice(
+  mi_df,
+  m = 5,
+  method = meth,
+  predictorMatrix = pred,
+  maxit = 10,
+  seed = 629,
+  printFlag = TRUE
+)
+
+fit_mi <- with(
+  imp,
+  coxph(
+    Surv(OS_MONTHS, event) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED +
+      TMB_NONSYNONYMOUS + SMOKING_PREDICTIONS_3_CLASSES + HISTORY_OF_PDL1 +
+      PRIOR_MED_TO_MSK + PDL1_POSITIVE
+  )
+)
+
+pooled_fit <- pool(fit_mi)
+mi_results <- summary(pooled_fit) %>%
+  mutate(
+    HR = exp(estimate),
+    conf.low = exp(estimate - 1.96 * std.error),
+    conf.high = exp(estimate + 1.96 * std.error)
+  )
+
+get_cindex <- function(i) {
+  dat_i <- complete(imp, action = i)
+  fit_i <- coxph(
+    Surv(OS_MONTHS, event) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED +
+      TMB_NONSYNONYMOUS + SMOKING_PREDICTIONS_3_CLASSES + HISTORY_OF_PDL1 +
+      PRIOR_MED_TO_MSK + PDL1_POSITIVE,
+    data = dat_i
+  )
+  c(summary(fit_i)$concordance[1], summary(fit_i)$concordance[2])
+}
+
+cindex_mat <- do.call(rbind, lapply(1:5, get_cindex))
+colnames(cindex_mat) <- c("c_index", "c_index_se")
+
+mi_perf <- data.frame(
+  method = "Multiple imputation (MICE)",
+  n = nrow(mi_df),
+  events = sum(mi_df$event == 1),
+  c_index = round(mean(cindex_mat[, "c_index"]), 4),
+  c_index_se = round(mean(cindex_mat[, "c_index_se"]), 4)
+)
+
+mi_df1 <- complete(imp, action = 1)
+cox_mi1 <- coxph(
+  Surv(OS_MONTHS, event) ~ CURRENT_AGE_DEID + GENDER + STAGE_HIGHEST_RECORDED +
+    TMB_NONSYNONYMOUS + SMOKING_PREDICTIONS_3_CLASSES + HISTORY_OF_PDL1 +
+    PRIOR_MED_TO_MSK + PDL1_POSITIVE,
+  data = mi_df1
+)
+
+mi_df1 <- mi_df1 %>%
+  mutate(
+    risk_score = predict(cox_mi1, type = "lp"),
+    risk_group = ifelse(risk_score >= median(risk_score, na.rm = TRUE), "High risk", "Low risk"),
+    risk_group = factor(risk_group, levels = c("Low risk", "High risk"))
+  )
+
+mi_results_clean <- mi_results[, c("term", "HR", "conf.low", "conf.high", "p.value")]
+
+mi_perf
+mi_results_clean
+
+write.csv(mi_results, file.path(tab_dir, "cox_mice_results_full.csv"), row.names = FALSE)
+write.csv(mi_results_clean, file.path(tab_dir, "cox_mice_results_clean.csv"), row.names = FALSE)
+write.csv(mi_perf, file.path(tab_dir, "cox_mice_performance.csv"), row.names = FALSE)
+write.csv(mi_df1, file.path(data_dir, "mice_dataset1_with_riskscore.csv"), row.names = FALSE)
+saveRDS(imp, file.path(model_dir, "mice_object.rds"))
+saveRDS(pooled_fit, file.path(model_dir, "cox_mice_pooled_model.rds"))
+saveRDS(mi_df1, file.path(data_dir, "mice_dataset1_with_riskscore.rds"))
+saveRDS(mi_results, file.path(model_dir, "cox_mice_results_full.rds"))
+saveRDS(mi_perf, file.path(model_dir, "cox_mice_performance.rds"))
+```
+
+## Performance comparison
+
+```{r}
+performance_compare <- bind_rows(cc_perf, si_perf, mi_perf)
+performance_compare_clean <- performance_compare %>%
+  mutate(
+    method = c("Complete-case", "Simple imputation", "Multiple imputation (MICE)")
+  )
+
+performance_compare_clean
+write.csv(performance_compare_clean, file.path(tab_dir, "performance_comparison_all_methods_clean.csv"), row.names = FALSE)
+```
+
+```{r}
+p_cindex <- ggplot(performance_compare_clean, aes(x = method, y = c_index, fill = method)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = c_index - c_index_se, ymax = c_index + c_index_se), width = 0.15, linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.3f", c_index)), vjust = -0.8, size = 5.5, fontface = "bold", color = "black") +
+  coord_cartesian(ylim = c(0.64, 0.685)) +
+  scale_fill_manual(values = c("#4C78A8", "#F58518", "#54A24B")) +
+  labs(title = "C-index comparison", x = NULL, y = "C-index") +
+  theme_classic(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title.y = element_text(size = 18, face = "bold"),
+    axis.text.x = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 13),
+    plot.margin = margin(15, 15, 10, 10)
+  )
+
+p_cindex
+
+ggsave(file.path(fig_dir, "cindex_plot_poster_final.png"), p_cindex, width = 10, height = 5.8, dpi = 300, bg = "white")
+```
+
+## Hazard ratio comparison
+
+```{r}
+cc_hr <- cc_results %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  mutate(method = "Complete-case", HR = estimate) %>%
+  select(method, term, HR, conf.low, conf.high, p.value)
+
+si_hr <- si_results %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  mutate(method = "Simple imputation", HR = estimate) %>%
+  select(method, term, HR, conf.low, conf.high, p.value)
+
+mi_hr <- mi_results_clean %>%
+  mutate(method = "Multiple imputation (MICE)") %>%
+  select(method, term, HR, conf.low, conf.high, p.value)
+
+hr_compare_long <- bind_rows(cc_hr, si_hr, mi_hr) %>%
+  mutate(
+    HR = round(HR, 3),
+    conf.low = round(conf.low, 3),
+    conf.high = round(conf.high, 3),
+    p.value = signif(p.value, 3)
+  )
+
+key_terms <- c(
+  "CURRENT_AGE_DEID", "GENDERMale", "STAGE_HIGHEST_RECORDEDStage 4",
+  "SMOKING_PREDICTIONS_3_CLASSESNever", "HISTORY_OF_PDL1Yes",
+  "PRIOR_MED_TO_MSKPrior medications to MSK", "PDL1_POSITIVEYes"
+)
+
+hr_compare_key <- hr_compare_long %>%
+  filter(term %in% key_terms)
+
+write.csv(hr_compare_long, file.path(tab_dir, "hr_comparison_long_table.csv"), row.names = FALSE)
+write.csv(hr_compare_key, file.path(tab_dir, "hr_comparison_key_terms.csv"), row.names = FALSE)
+```
+
+```{r}
+plot_hr_all <- hr_compare_key %>%
+  mutate(
+    method = factor(
+      method,
+      levels = c("Complete-case", "Simple imputation", "Multiple imputation (MICE)"),
+      labels = c("Complete-case", "Simple", "MICE")
+    ),
+    term = factor(
+      term,
+      levels = c(
+        "PDL1_POSITIVEYes", "PRIOR_MED_TO_MSKPrior medications to MSK",
+        "HISTORY_OF_PDL1Yes", "SMOKING_PREDICTIONS_3_CLASSESNever",
+        "STAGE_HIGHEST_RECORDEDStage 4", "GENDERMale", "CURRENT_AGE_DEID"
+      ),
+      labels = c(
+        "PD-L1 positive", "Prior medication to MSK", "History of PD-L1",
+        "Never smoker", "Stage 4", "Male", "Age"
+      )
+    )
+  )
+
+p_hr <- ggplot(plot_hr_all, aes(x = HR, y = term, color = method)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  geom_point(position = position_dodge(width = 0.6), size = 3.2) +
+  geom_errorbarh(
+    aes(xmin = conf.low, xmax = conf.high),
+    position = position_dodge(width = 0.6),
+    height = 0.22,
+    linewidth = 0.9
+  ) +
+  scale_color_manual(values = c("Complete-case" = "#4C78A8", "Simple" = "#F58518", "MICE" = "#54A24B")) +
+  labs(title = "Hazard ratios across methods", x = "Hazard ratio", y = NULL, color = NULL) +
+  coord_cartesian(xlim = c(0.6, 3.1)) +
+  theme_classic(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title.x = element_text(size = 17, face = "bold"),
+    axis.text.y = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(size = 12),
+    legend.position = "top",
+    plot.margin = margin(15, 15, 10, 10)
+  )
+
+p_hr
+
+ggsave(file.path(fig_dir, "hr_plot_poster_final.png"), p_hr, width = 10, height = 6.5, dpi = 300, bg = "white")
+```
+
+## Kaplan-Meier risk stratification
+
+```{r}
+fit_km_si <- survfit(Surv(OS_MONTHS, event) ~ risk_group, data = si_df)
+
+km_plot_si <- survminer::ggsurvplot(
+  fit_km_si,
+  data = si_df,
+  risk.table = FALSE,
+  pval = TRUE,
+  conf.int = FALSE,
+  palette = c("#4C78A8", "#F58518"),
+  legend.title = NULL,
+  legend.labs = c("Low risk", "High risk"),
+  xlab = "Overall survival time",
+  ylab = "Survival probability",
+  title = "Risk stratification (simple imputation)",
+  ggtheme = theme_classic(base_size = 16),
+  fontsize = 5
+)
+
+km_plot_si$plot <- km_plot_si$plot +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 12),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    plot.margin = margin(15, 15, 10, 10)
+  )
+
+km_plot_si
+
+ggsave(file.path(fig_dir, "km_plot_simple_imputation_final.png"), km_plot_si$plot, width = 9, height = 6.2, dpi = 300, bg = "white")
+```
+
+## Save main analysis dataset
+
+```{r}
+write.csv(nsclc_analysis_df, file.path(data_dir, "nsclc_analysis_df.csv"), row.names = FALSE)
+saveRDS(nsclc_analysis_df, file.path(data_dir, "nsclc_analysis_df.rds"))
+```
